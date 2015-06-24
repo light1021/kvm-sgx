@@ -2326,6 +2326,24 @@ static void vmx_set_interrupt_shadow(struct kvm_vcpu *vcpu, int mask)
 		vmcs_write32(GUEST_INTERRUPTIBILITY_INFO, interruptibility);
 }
 
+static bool vmx_exit_from_enclave(struct kvm_vcpu *vcpu)
+{
+	/*
+	 * We have 2 bits to indicate whether VMEXIT happens from enclave -- bit
+	 * 27 in VM_EXIT_REASON, and bit 4 in GUEST_INTERRUPTIBILITY_INFO.
+	 * Currently use latter to check whether VMEXIT happens from enclave,
+	 * but note that we never clear this bit therefore we assume hardware
+	 * will clear this bit when VMEXIT happens not from enclave, which
+	 * should be the case.
+	 *
+	 * We can either do this via bit 27 in VM_EXIT_REASON, by adding a bool
+	 * in vmx and set it in vmx_handle_exit when above bit is set, and clear
+	 * the bool right before vmentry to guest.
+	 */
+	return vmcs_read32(GUEST_INTERRUPTIBILITY_INFO) &
+		GUEST_INTR_STATE_ENCLAVE_INTR ? true : false;
+}
+
 static void skip_emulated_instruction(struct kvm_vcpu *vcpu)
 {
 	unsigned long rip;
@@ -4881,6 +4899,25 @@ static u32 vmx_secondary_exec_control(struct vcpu_vmx *vmx)
 	return exec_control;
 }
 
+static void vmcs_set_secondary_exec_control(u32 new_ctl)
+{
+	/*
+	 * These bits in the secondary execution controls field
+	 * are dynamic, the others are mostly based on the hypervisor
+	 * architecture and the guest's CPUID.  Do not touch the
+	 * dynamic bits.
+	 */
+	u32 mask =
+		SECONDARY_EXEC_SHADOW_VMCS |
+		SECONDARY_EXEC_VIRTUALIZE_X2APIC_MODE |
+		SECONDARY_EXEC_VIRTUALIZE_APIC_ACCESSES;
+
+	u32 cur_ctl = vmcs_read32(SECONDARY_VM_EXEC_CONTROL);
+
+	vmcs_write32(SECONDARY_VM_EXEC_CONTROL,
+		     (new_ctl & ~mask) | (cur_ctl & mask));
+}
+
 static void ept_set_mmio_spte_mask(void)
 {
 	/*
@@ -5755,6 +5792,12 @@ static void vmx_set_dr7(struct kvm_vcpu *vcpu, unsigned long val)
 
 static int handle_cpuid(struct kvm_vcpu *vcpu)
 {
+	/* CPUID is invalid in enclave */
+	if (vmx_exit_from_enclave(vcpu)) {
+		kvm_inject_gp(vcpu, 0);
+		return 1;
+	}
+
 	kvm_emulate_cpuid(vcpu);
 	return 1;
 }
@@ -5835,6 +5878,16 @@ static int handle_vmcall(struct kvm_vcpu *vcpu)
 
 static int handle_invd(struct kvm_vcpu *vcpu)
 {
+	/*
+	 * SDM 39.6.5 INVD Handling when Enclaves Are Enabled.
+	 *
+	 * Spec says INVD causes #GP if EPC is enabled.
+	 */
+	if (vmx_exit_from_enclave(vcpu)) {
+		kvm_inject_gp(vcpu, 0);
+		return 1;
+	}
+
 	return emulate_instruction(vcpu, 0) == EMULATE_DONE;
 }
 
@@ -5859,6 +5912,18 @@ static int handle_rdpmc(struct kvm_vcpu *vcpu)
 
 static int handle_wbinvd(struct kvm_vcpu *vcpu)
 {
+	/*
+	 * SDM 39.6.5 INVD Handling when Enclaves Are Enabled.
+	 *
+	 * Spec says INVD causes #GP if EPC is enabled.
+	 *
+	 * FIXME: Does this also apply to WBINVD?
+	 */
+	if (vmx_exit_from_enclave(vcpu)) {
+		kvm_inject_gp(vcpu, 0);
+		return 1;
+	}
+
 	kvm_emulate_wbinvd(vcpu);
 	return 1;
 }
@@ -6460,6 +6525,31 @@ static __exit void hardware_unsetup(void)
  */
 static int handle_pause(struct kvm_vcpu *vcpu)
 {
+	/*
+	 * SDM 39.6.3 PAUSE Instruction.
+	 *
+	 * SDM suggests, if VMEXIT caused by 'PAUSE-loop exiting', VMM should
+	 * disable 'PAUSE-loop exiting' so PAUSE can be executed in Enclave
+	 * again without further PAUSE-looping VMEXIT.
+	 *
+	 * SDM suggests, if VMEXIT caused by 'PAUSE exiting', VMM should disable
+	 * 'PAUSE exiting' so PAUSE can be executed in Enclave again without
+	 * further PAUSE VMEXIT.
+	 */
+	if (vmx_exit_from_enclave(vcpu)) {
+		u32 exec_ctl, secondary_exec_ctl;
+
+		exec_ctl = vmx_exec_control(to_vmx(vcpu));
+		exec_ctl &= ~CPU_BASED_PAUSE_EXITING;
+		vmcs_write32(CPU_BASED_VM_EXEC_CONTROL, exec_ctl);
+
+		secondary_exec_ctl = vmx_secondary_exec_control(to_vmx(vcpu));
+		secondary_exec_ctl &= ~SECONDARY_EXEC_PAUSE_LOOP_EXITING;
+		vmcs_set_secondary_exec_control(secondary_exec_ctl);
+
+		return 1;
+	}
+
 	if (ple_gap)
 		grow_ple_window(vcpu);
 
@@ -6849,6 +6939,12 @@ static int handle_vmon(struct kvm_vcpu *vcpu)
 	const u64 VMXON_NEEDED_FEATURES = FEATURE_CONTROL_LOCKED
 		| FEATURE_CONTROL_VMXON_ENABLED_OUTSIDE_SMX;
 
+	/* VMON is invalid in enclvae */
+	if (vmx_exit_from_enclave(vcpu)) {
+		kvm_inject_gp(vcpu, 0);
+		return 1;
+	}
+
 	/* The Intel VMX Instruction Reference lists a bunch of bits that
 	 * are prerequisite to running VMXON, most notably cr4.VMXE must be
 	 * set to 1 (see vmx_set_cr4() for when we allow the guest to set this).
@@ -7003,6 +7099,12 @@ static void free_nested(struct vcpu_vmx *vmx)
 /* Emulate the VMXOFF instruction */
 static int handle_vmoff(struct kvm_vcpu *vcpu)
 {
+	/* VMOFF is invalid in enclvae */
+	if (vmx_exit_from_enclave(vcpu)) {
+		kvm_inject_gp(vcpu, 0);
+		return 1;
+	}
+
 	if (!nested_vmx_check_permission(vcpu))
 		return 1;
 	free_nested(to_vmx(vcpu));
@@ -8236,6 +8338,25 @@ static int vmx_handle_exit(struct kvm_vcpu *vcpu)
 	}
 
 	/*
+	 * Bit 27 of exit_reason will also be set if VMEXT happens in SGX
+	 * enclave.
+	 */
+	if (exit_reason & VMX_EXIT_REASON_FROM_ENCLAVE) {
+		/*
+		 * Clear bit 27 otherwise further check of calling vmx handler
+		 * would fail.
+		 */
+		exit_reason &= ~VMX_EXIT_REASON_FROM_ENCLAVE;
+#if 0
+		pr_info("%s: vcpu %d: VMEXIT from SGX enclave: clear ENCLAVE bit: "
+				"exit_reason %d -> %d\n",
+				__func__, vcpu->vcpu_id,
+				exit_reason | VMX_EXIT_REASON_FROM_ENCLAVE,
+				exit_reason);
+#endif
+	}
+
+	/*
 	 * Note:
 	 * Do not try to fix EXIT_REASON_EPT_MISCONFIG if it caused by
 	 * delivery event since it indicates guest is accessing MMIO.
@@ -9052,25 +9173,6 @@ static int vmx_get_lpage_level(void)
 	else
 		/* For shadow and EPT supported 1GB page */
 		return PT_PDPE_LEVEL;
-}
-
-static void vmcs_set_secondary_exec_control(u32 new_ctl)
-{
-	/*
-	 * These bits in the secondary execution controls field
-	 * are dynamic, the others are mostly based on the hypervisor
-	 * architecture and the guest's CPUID.  Do not touch the
-	 * dynamic bits.
-	 */
-	u32 mask =
-		SECONDARY_EXEC_SHADOW_VMCS |
-		SECONDARY_EXEC_VIRTUALIZE_X2APIC_MODE |
-		SECONDARY_EXEC_VIRTUALIZE_APIC_ACCESSES;
-
-	u32 cur_ctl = vmcs_read32(SECONDARY_VM_EXEC_CONTROL);
-
-	vmcs_write32(SECONDARY_VM_EXEC_CONTROL,
-		     (new_ctl & ~mask) | (cur_ctl & mask));
 }
 
 static void guest_cpuid_disable_sgx(struct kvm_vcpu *vcpu)
