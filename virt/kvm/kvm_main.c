@@ -1429,9 +1429,35 @@ static kvm_pfn_t hva_to_pfn(unsigned long addr, bool atomic, bool *async,
 	if (vma == NULL)
 		pfn = KVM_PFN_ERR_FAULT;
 	else if ((vma->vm_flags & VM_PFNMAP)) {
+		unsigned long pfn2;
+#if 0
+		bool tried = false;
 		pfn = ((addr - vma->vm_start) >> PAGE_SHIFT) +
 			vma->vm_pgoff;
-		BUG_ON(!kvm_is_reserved_pfn(pfn));
+again:
+#endif
+		/*
+		 * VM_PFNMAP doesn't suggest the PFNs must be continuous, so we
+		 * need to find pfn by looking page table. This is must for EPC
+		 * as EPC won't be physically contiuous.
+		 */
+		if (!follow_pfn(vma, addr, &pfn2)) {
+			pfn = (kvm_pfn_t)pfn2;
+			BUG_ON(!kvm_is_reserved_pfn(pfn));
+			goto exit;
+		}
+#if 0
+		if (vma->vm_ops && vma->vm_ops->fault && !tried) {
+			struct vm_fault vmf;
+
+			memset(&vmf, 0, sizeof(vmf));
+			vmf.virtual_address = (void __user *)addr;
+			vma->vm_ops->fault(vma, &vmf);
+			tried = true;
+			goto again;
+		}
+#endif
+		pfn = KVM_PFN_ERR_FAULT;
 	} else {
 		if (async && vma_is_valid(vma, write_fault))
 			*async = true;
