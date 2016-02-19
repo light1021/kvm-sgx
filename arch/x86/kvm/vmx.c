@@ -2922,7 +2922,7 @@ static int vmx_get_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
 		msr_info->data = vmcs_read64(GUEST_BNDCFGS);
 		break;
 	case MSR_IA32_FEATURE_CONTROL:
-		if (!nested_vmx_allowed(vcpu))
+		if (!nested_vmx_allowed(vcpu) && !guest_cpuid_has_sgx(vcpu))
 			return 1;
 		msr_info->data = to_vmx(vcpu)->msr_ia32_feature_control;
 		break;
@@ -3014,15 +3014,30 @@ static int vmx_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
 	case MSR_IA32_TSC_ADJUST:
 		ret = kvm_set_msr_common(vcpu, msr_info);
 		break;
-	case MSR_IA32_FEATURE_CONTROL:
-		if (!nested_vmx_allowed(vcpu) ||
-		    (to_vmx(vcpu)->msr_ia32_feature_control &
-		     FEATURE_CONTROL_LOCKED && !msr_info->host_initiated))
+	case MSR_IA32_FEATURE_CONTROL: {
+		u64 not_allowed;
+
+		if ((to_vmx(vcpu)->msr_ia32_feature_control &
+				FEATURE_CONTROL_LOCKED) &&
+				!msr_info->host_initiated)
 			return 1;
+
+		if (!nested_vmx_allowed(vcpu) && !guest_cpuid_has_sgx(vcpu))
+			return 1;
+
+		/* Currently SGX is not exposed to nested */
+		not_allowed = FEATURE_CONTROL_VMXON_ENABLED_INSIDE_SMX |
+			FEATURE_CONTROL_SGX;
+		WARN_ON((data & not_allowed) == not_allowed);
+		not_allowed = FEATURE_CONTROL_VMXON_ENABLED_OUTSIDE_SMX |
+			FEATURE_CONTROL_SGX;
+		WARN_ON((data & not_allowed) == not_allowed);
+
 		vmx->msr_ia32_feature_control = data;
 		if (msr_info->host_initiated && data == 0)
 			vmx_leave_nested(vcpu);
 		break;
+	}
 	case MSR_IA32_VMX_BASIC ... MSR_IA32_VMX_VMFUNC:
 		return 1; /* they are read-only */
 	case MSR_IA32_XSS:
