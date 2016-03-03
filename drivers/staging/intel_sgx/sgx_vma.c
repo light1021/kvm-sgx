@@ -1,0 +1,283 @@
+/*
+ * (C) Copyright 2016 Intel Corporation
+ *
+ * Authors:
+ *
+ * Jarkko Sakkinen <jarkko.sakkinen@intel.com>
+ * Suresh Siddha <suresh.b.siddha@intel.com>
+ * Serge Ayoun <serge.ayoun@intel.com>
+ * Shay Katz-zamir <shay.katz-zamir@intel.com>
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; version 2
+ * of the License.
+ */
+
+#include "sgx.h"
+#include <asm/mman.h>
+#include <linux/delay.h>
+#include <linux/file.h>
+#include <linux/highmem.h>
+#include <linux/ratelimit.h>
+#include <linux/sched.h>
+#include <linux/slab.h>
+#include <linux/hashtable.h>
+#include <linux/shmem_fs.h>
+
+static void sgx_vma_open(struct vm_area_struct *vma)
+{
+	struct sgx_enclave *enclave;
+	struct sgx_vma *evma;
+
+	/* Was vm_private_data nullified as a result of the previous fork? */
+	enclave = vma->vm_private_data;
+	if (!enclave)
+		goto out_fork;
+
+	/* Was the process forked? mm_struct changes when the process is
+	 * forked.
+	 */
+	mutex_lock(&enclave->lock);
+	evma = list_first_entry(&enclave->vma_list,
+				struct sgx_vma, vma_list);
+	if (evma->vma->vm_mm != vma->vm_mm) {
+		mutex_unlock(&enclave->lock);
+		goto out_fork;
+	}
+	mutex_unlock(&enclave->lock);
+
+	mutex_lock(&enclave->lock);
+	if (!list_empty(&enclave->vma_list)) {
+		evma = kzalloc(sizeof(*evma), GFP_KERNEL);
+		if (!evma) {
+			sgx_invalidate(enclave);
+		} else {
+			evma->vma = vma;
+			list_add_tail(&evma->vma_list, &enclave->vma_list);
+		}
+	}
+	mutex_unlock(&enclave->lock);
+
+	kref_get(&enclave->refcount);
+	return;
+out_fork:
+	zap_vma_ptes(vma, vma->vm_start, vma->vm_end - vma->vm_start);
+	vma->vm_private_data = NULL;
+}
+
+static void sgx_vma_close(struct vm_area_struct *vma)
+{
+	struct sgx_enclave *enclave = vma->vm_private_data;
+	struct sgx_vma *evma;
+
+	/* If process was forked, VMA is still there but
+	 * vm_private_data is set to NULL.
+	 */
+	if (!enclave)
+		return;
+
+	mutex_lock(&enclave->lock);
+
+	/* On vma_close() we remove the vma from vma_list
+	 * there is a possibility that evma is not found
+	 * in case vma_open() has failed on memory allocation
+	 * and vma list has then been emptied
+	 */
+	evma = sgx_find_vma(enclave, vma->vm_start);
+	if (evma) {
+		list_del(&evma->vma_list);
+		kfree(evma);
+	}
+
+	vma->vm_private_data = NULL;
+
+	sgx_zap_tcs_ptes(enclave, vma);
+	zap_vma_ptes(vma, vma->vm_start, vma->vm_end - vma->vm_start);
+
+	mutex_unlock(&enclave->lock);
+
+	kref_put(&enclave->refcount, sgx_enclave_release);
+}
+
+static int do_eldu(struct sgx_enclave *enclave,
+		   struct sgx_enclave_page *enclave_page,
+		   struct sgx_epc_page *epc_page,
+		   struct page *backing,
+		   bool is_secs)
+{
+	struct sgx_page_info pginfo;
+	void *secs_ptr = NULL;
+	void *epc_ptr;
+	void *va_ptr;
+	int ret;
+
+	pginfo.srcpge = (unsigned long)kmap_atomic(backing);
+	if (!is_secs)
+		secs_ptr = sgx_get_epc_page(enclave->secs_page.epc_page);
+	pginfo.secs = (unsigned long)secs_ptr;
+
+	epc_ptr = sgx_get_epc_page(epc_page);
+	va_ptr = sgx_get_epc_page(enclave_page->va_page->epc_page);
+
+	pginfo.linaddr = is_secs ? 0 : enclave_page->addr;
+	pginfo.pcmd = (unsigned long)&enclave_page->pcmd;
+
+	ret = __eldu((unsigned long)&pginfo,
+		     (unsigned long)epc_ptr,
+		     (unsigned long)va_ptr +
+		     enclave_page->va_offset);
+
+	sgx_put_epc_page(va_ptr);
+	sgx_put_epc_page(epc_ptr);
+
+	if (!is_secs)
+		sgx_put_epc_page(secs_ptr);
+
+	kunmap_atomic((void *)(unsigned long)pginfo.srcpge);
+	WARN_ON(ret);
+	if (ret)
+		return -EFAULT;
+
+	return 0;
+}
+
+static struct sgx_enclave_page *sgx_vma_do_fault(struct vm_area_struct *vma,
+						 unsigned long addr,
+						 int reserve)
+{
+	struct sgx_enclave *enclave = vma->vm_private_data;
+	struct sgx_enclave_page *entry;
+	struct sgx_epc_page *epc_page;
+	struct sgx_epc_page *secs_epc_page = NULL;
+	struct page *backing;
+	unsigned free_flags = ISGX_FREE_SKIP_EREMOVE;
+	int rc;
+
+	/* If process was forked, VMA is still there but vm_private_data is set
+	 * to NULL.
+	 */
+	if (!enclave)
+		return ERR_PTR(-EFAULT);
+
+	entry = sgx_enclave_find_page(enclave, addr);
+	if (!entry)
+		return ERR_PTR(-EFAULT);
+
+	/* We use atomic allocation in the #PF handler in order to avoid ABBA
+	 * deadlock with mmap_sems.
+	 */
+	epc_page = sgx_alloc_epc_page(enclave->tgid_ctx, ISGX_ALLOC_ATOMIC);
+	if (IS_ERR(epc_page))
+		return (struct sgx_enclave_page *)epc_page;
+
+	/* The SECS page is not currently accounted. */
+	secs_epc_page = sgx_alloc_epc_page(enclave->tgid_ctx,
+					   ISGX_ALLOC_ATOMIC);
+	if (IS_ERR(secs_epc_page)) {
+		sgx_free_epc_page(epc_page, enclave, ISGX_FREE_SKIP_EREMOVE);
+		return (struct sgx_enclave_page *)secs_epc_page;
+	}
+
+	mutex_lock(&enclave->lock);
+
+	if (list_empty(&enclave->vma_list)) {
+		entry = ERR_PTR(-EFAULT);
+		goto out;
+	}
+
+	if (!(enclave->flags & ISGX_ENCLAVE_INITIALIZED)) {
+		sgx_dbg(enclave, "cannot fault, unitialized\n");
+		entry = ERR_PTR(-EFAULT);
+		goto out;
+	}
+
+	if (reserve && (entry->flags & ISGX_ENCLAVE_PAGE_RESERVED)) {
+		sgx_dbg(enclave, "cannot fault, 0x%lx is reserved\n",
+			entry->addr);
+		entry = ERR_PTR(-EBUSY);
+		goto out;
+	}
+
+	/* Legal race condition, page is already faulted. */
+	if (entry->epc_page) {
+		if (reserve)
+			entry->flags |= ISGX_ENCLAVE_PAGE_RESERVED;
+		goto out;
+	}
+
+	/* If SECS is evicted then reload it first */
+	if (enclave->flags & ISGX_ENCLAVE_SECS_EVICTED) {
+		backing = sgx_get_backing(enclave, &enclave->secs_page);
+		if (IS_ERR(backing)) {
+			entry = (void *)backing;
+			goto out;
+		}
+
+		rc = do_eldu(enclave, &enclave->secs_page, secs_epc_page,
+			     backing, true /* is_secs */);
+		sgx_put_backing(backing, 0);
+		if (rc)
+			goto out;
+
+		enclave->secs_page.epc_page = secs_epc_page;
+		enclave->flags &= ~ISGX_ENCLAVE_SECS_EVICTED;
+
+		/* Do not free */
+		secs_epc_page = NULL;
+	}
+
+	backing = sgx_get_backing(enclave, entry);
+	if (IS_ERR(backing)) {
+		entry = (void *)backing;
+		goto out;
+	}
+
+	do_eldu(enclave, entry, epc_page, backing, false /* is_secs */);
+	rc = vm_insert_pfn(vma, entry->addr, PFN_DOWN(epc_page->pa));
+	sgx_put_backing(backing, 0);
+
+	if (rc) {
+		free_flags = 0;
+		goto out;
+	}
+
+	enclave->secs_child_cnt++;
+
+	entry->epc_page = epc_page;
+
+	if (reserve)
+		entry->flags |= ISGX_ENCLAVE_PAGE_RESERVED;
+
+	/* Do not free */
+	epc_page = NULL;
+
+	list_add_tail(&entry->load_list, &enclave->load_list);
+out:
+	mutex_unlock(&enclave->lock);
+	if (epc_page)
+		sgx_free_epc_page(epc_page, enclave, free_flags);
+	if (secs_epc_page)
+		sgx_free_epc_page(secs_epc_page, enclave,
+				  ISGX_FREE_SKIP_EREMOVE);
+	return entry;
+}
+
+static int sgx_vma_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
+{
+	unsigned long addr = (unsigned long)vmf->virtual_address;
+	struct sgx_enclave_page *entry;
+
+	entry = sgx_vma_do_fault(vma, addr, 0);
+
+	if (!IS_ERR(entry) || PTR_ERR(entry) == -EBUSY)
+		return VM_FAULT_NOPAGE;
+	else
+		return VM_FAULT_SIGBUS;
+}
+
+struct vm_operations_struct sgx_vm_ops = {
+	.close = sgx_vma_close,
+	.open = sgx_vma_open,
+	.fault = sgx_vma_fault,
+};
