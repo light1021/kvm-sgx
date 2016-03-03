@@ -1,0 +1,119 @@
+1. Intel(R) SGX overview
+========================
+
+Intel(R) SGX is a set of CPU instructions that can be used by applications to
+set aside private regions of code and data. The code outside the enclave is
+disallowed to access the memory inside the enclave by the CPU access control.
+In a way you can think that SGX provides inverted sandbox. It protects the
+application from a malicious host.
+
+There is a new hardware unit in the processor called Memory Encryption Engine
+(MEE) starting from the Skylake microachitecture. BIOS can define one or many
+MEE regions that can hold enclave data by configuring them with PRMRR registers.
+
+The MEE automatically encrypts the data leaving the processor package to the MEE
+regions. The data is encrypted using a random key whose life-time is exactly one
+power cycle.
+
+You can tell if your CPU supports SGX by looking into /proc/cpuinfo:
+
+	cat /proc/cpuinfo  | grep ' sgx '
+
+2. Enclaves overview
+====================
+
+SGX defines new data types to maintain information about the enclaves and their
+security properties.
+
+The following data structures exist in MEE regions:
+
+* Enclave Page Cache (EPC): protected code and data
+* Enclave Page Cache Map (EPCM): meta-data for each EPC page
+
+The Enclave Page Cache can hold following types EPC pages:
+
+* SGX Enclave Control Structure (SECS): contains meta-data defining the global
+  properties of an enclave such as range of addresses it can access.
+* Regular EPC pages containing code and data for the enclave.
+* Thread Control Structure (TCS): defines an entry point for a hardware thread
+  to enter into the enclave. The enclave can only be entered through these entry
+  points.
+* Version Array (VA): an EPC page receives a unique version number when it is
+  evicted that is stored into a VA page. A VA page can hold up to 512 version
+  numbers.
+
+There is also a new opcode called ENCLS, which provides leaf instructions for
+defining memory area for the enclave and adding and measuring EPC pages. Finally
+there is a leaf instruction ENCLS(EINIT) that initializes the measured enclave.
+
+When initializing an enclave, two structures must be provided for ENCLS(EINIT):
+
+1. SIGSTRUCT: contains a vendor signed measurement of the enclave
+   binary. ENCLS(EINIT) will check that measurements are equal and only
+   allow enclave to run if they are.
+2. EINITTOKEN: contains the measurement, the vendor public key and various
+   enclave attributes. The structure also contains a MAC of its contents using
+   hardware derived symmetric key called lauch key. Only an enclave with a
+   valid EINITTOKEN can be launched.
+
+3. The root of trust
+====================
+
+Intel SGX features a launch control which governs the creation of enclaves. Only
+a launch enclave, i.e. an enclave with SECS.ATTRIBUTES.EINITTOKENKEY = 1, can
+generate a valid mac for EINITTOKEN by acquiring the launch using
+ENCLS(EGETKEY).
+
+With the Skylake generation only the Intel root of trust is available. The
+future generations of IA provide IA32_SGXLEPUBKEYHASH MSRs taht allow to specify
+any root of trust.
+
+There is a special type of enclave called debug enclave that is convenient when
+the enclave code is being developed. These enclaves can be read and write by
+using EDBGWR and EDBGRD leaf instructions. The kernel driver provides ptrace()
+interface for enclaves by using these instructions.
+
+The launch enclave bundled with Intel SGX SDK allows to run debug enclaves by
+always providing them a valid EINITTOKEN.
+
+4. Related platform configuration registers
+===========================================
+
+IA32_SGXLEPUBKEYHASH0-3
+
+These registers specify SHA256 digest of the modulus of the public key. On reset,
+the default value is Intel's signing key.
+
+IA32_FEATURE_CONTROL.Lock (0)
+
+This is a one shot register that must be set by BIOS before SGX can be used.
+Otherwise, ENCLS will fail to function. After it is set, the writes to it will
+result #GP.
+
+IA32_FEATURE_CONTROL.LE_WR (17)
+
+This bit must be set in order to allow writes to IA32_SGXLEPUBKEYHASH. It is
+normally cleared by the BIOS before handover to the OS. By leaving this bit
+written system can support multiple launch enclaves for multiple execution
+environments.
+
+5. IOCTL API
+============
+
+SGX_IOC_ENCLAVE_CREATE
+
+Given an address and a SECS page creates an enclave to a VMA. The VMA must
+be of the same size as the enclave to be created is. Executes ENCLS(ECREATE)
+and creates internal book keeping data structures for the enclave.
+
+SGX_IOC_ENCLAVE_ADD_PAGE
+
+Adds and measures a new EPC page for the enclave. The address must be in the
+range defined of the enclave.
+
+SGX_IOC_ENCLAVE_INIT
+
+Initializes an enclave given by SIGSTRUCT and EINITTOKEN. Executes EINIT leaf
+instruction that will check that the measurement matches the one inSIGSTRUCT and
+EINITTOKEN. EINITTOKEN is a data blob given by a special enclave called Launch
+Enclave and it is signed with a CPU's Launch Key.
