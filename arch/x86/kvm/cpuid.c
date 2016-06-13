@@ -117,6 +117,15 @@ int kvm_update_cpuid(struct kvm_vcpu *vcpu)
 	if (use_eager_fpu())
 		kvm_x86_ops->fpu_activate(vcpu);
 
+	/* SGX interaction with XSAVE */
+	best = kvm_find_cpuid_entry(vcpu, 0x12, 0x1);
+	if (best) {
+		best->ecx &= (unsigned int)
+			(vcpu->arch.guest_supported_xcr0 & 0xffffffff);
+		best->ecx |= 0x3;
+		best->edx &= (unsigned int)
+			(vcpu->arch.guest_supported_xcr0 >> 32);
+	}
 	/*
 	 * The existing code assumes virtual address is 48-bit in the canonical
 	 * address checks; exit if it is ever changed.
@@ -364,7 +373,7 @@ static inline int __do_cpuid_ent(struct kvm_cpuid_entry2 *entry, u32 function,
 		F(FSGSBASE) | F(BMI1) | F(HLE) | F(AVX2) | F(SMEP) |
 		F(BMI2) | F(ERMS) | f_invpcid | F(RTM) | f_mpx | F(RDSEED) |
 		F(ADX) | F(SMAP) | F(AVX512F) | F(AVX512PF) | F(AVX512ER) |
-		F(AVX512CD) | F(CLFLUSHOPT) | F(CLWB) | F(PCOMMIT);
+		F(AVX512CD) | F(CLFLUSHOPT) | F(CLWB) | F(PCOMMIT) | F(SGX);
 
 	/* cpuid 0xD.1.eax */
 	const u32 kvm_cpuid_D_1_eax_x86_features =
@@ -386,7 +395,7 @@ static inline int __do_cpuid_ent(struct kvm_cpuid_entry2 *entry, u32 function,
 
 	switch (function) {
 	case 0:
-		entry->eax = min(entry->eax, (u32)0xd);
+		entry->eax = min(entry->eax, (u32)0x12);
 		break;
 	case 1:
 		entry->edx &= kvm_cpuid_1_edx_x86_features;
@@ -553,6 +562,43 @@ static inline int __do_cpuid_ent(struct kvm_cpuid_entry2 *entry, u32 function,
 			++*nent;
 			++i;
 		}
+		break;
+	}
+	case 0x12: {
+		WARN_ON(index != 0);
+
+		/*
+		 * FIXME: SGX should be supported if we reach here.. Should we
+		 * add check for CPUID.0x7.0.EBX for SGX here?
+		 */
+
+		/* do_cpuid_1_ent has already been called for index 0 */
+		entry->flags |= KVM_CPUID_FLAG_SIGNIFCANT_INDEX;
+
+		/* Index 1: SECS.ATTRIBUTE */
+		do_cpuid_1_ent(++entry, 0x12, 0x1);
+		entry->flags |= KVM_CPUID_FLAG_SIGNIFCANT_INDEX;
+		++*nent;
+		/*
+		 * Index 2: EPC section
+		 *
+		 * Note: We only report one EPC section as Qemu doesn't
+		 * need physical EPC info. And actually Qemu should
+		 * patch virtual EPC base, size to the supported CPUID
+		 * to reflect virtual EPC exposed to guest. For virtual
+		 * EPC, one EPC section is obviously enough.
+		 */
+		do_cpuid_1_ent(++entry, 0x12, 0x2);
+		entry->flags |= KVM_CPUID_FLAG_SIGNIFCANT_INDEX;
+		/*
+		 * Guangrong suggests we should not expose real EPC info to Qemu
+		 * but just reports base and size as 0.
+		 */
+		entry->eax &= 0xf;
+		entry->ebx = 0;
+		entry->ecx &= 0xf;
+		entry->edx = 0;
+		++*nent;
 		break;
 	}
 	case KVM_CPUID_SIGNATURE: {

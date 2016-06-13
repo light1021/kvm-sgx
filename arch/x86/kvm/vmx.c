@@ -2751,6 +2751,25 @@ static void nested_vmx_setup_ctls_msrs(struct vcpu_vmx *vmx)
 	vmx->nested.nested_vmx_misc_high = 0;
 }
 
+static bool guest_cpuid_has_sgx(struct kvm_vcpu *vcpu)
+{
+	struct kvm_cpuid_entry2 *best;
+
+	best = kvm_find_cpuid_entry(vcpu, 0x7, 0);
+	if (!best)
+		return false;
+	if (!(best->ebx & bit(X86_FEATURE_SGX)))
+		return false;
+
+	best = kvm_find_cpuid_entry(vcpu, 0x12, 0);
+	if (!best)
+		return false;
+	if (!(best->eax & 0x1))
+		return false;
+
+	return true;
+}
+
 static inline bool vmx_control_verify(u32 control, u32 low, u32 high)
 {
 	/*
@@ -9039,6 +9058,31 @@ static void vmcs_set_secondary_exec_control(u32 new_ctl)
 		     (new_ctl & ~mask) | (cur_ctl & mask));
 }
 
+static void guest_cpuid_disable_sgx(struct kvm_vcpu *vcpu)
+{
+	struct kvm_cpuid_entry2 *best;
+
+	best = kvm_find_cpuid_entry(vcpu, 0x0, 0);
+	if (best)
+		best->eax = min(best->eax, (u32)0xd);
+
+	best = kvm_find_cpuid_entry(vcpu, 0x7, 0);
+	if (best)
+		best->ebx &= ~bit(X86_FEATURE_SGX);
+
+	best = kvm_find_cpuid_entry(vcpu, 0x12, 0);
+	if (best)
+		memset(best, 0, sizeof(*best));
+
+	best = kvm_find_cpuid_entry(vcpu, 0x12, 1);
+	if (best)
+		memset(best, 0, sizeof(*best));
+
+	best = kvm_find_cpuid_entry(vcpu, 0x12, 2);
+	if (best)
+		memset(best, 0, sizeof(*best));
+}
+
 static void vmx_cpuid_update(struct kvm_vcpu *vcpu)
 {
 	struct kvm_cpuid_entry2 *best;
@@ -9082,6 +9126,9 @@ static void vmx_cpuid_update(struct kvm_vcpu *vcpu)
 			vmx->nested.nested_vmx_secondary_ctls_high &=
 				~SECONDARY_EXEC_PCOMMIT;
 	}
+
+	if (boot_cpu_has(X86_FEATURE_SGX) && nested)
+		guest_cpuid_disable_sgx(vcpu);
 }
 
 static void vmx_set_supported_cpuid(u32 func, struct kvm_cpuid_entry2 *entry)
