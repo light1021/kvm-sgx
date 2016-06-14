@@ -5,4 +5,5 @@ intel_sgx-$(CONFIG_INTEL_SGX) += \
 	sgx_main.o \
 	sgx_page_cache.o \
 	sgx_util.o \
-	sgx_vma.o
+	sgx_vma.o \
+	sgx_vm.o

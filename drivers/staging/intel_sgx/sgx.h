@@ -241,4 +241,38 @@ void sgx_free_epc_page(struct sgx_epc_page *entry,
 struct sgx_epc_page *sgx_alloc_vm_epc_page(unsigned int flags);
 int sgx_free_vm_epc_page(struct sgx_epc_page *entry);
 
+/*
+ * Introduce dedicated functions for allocating and free EPC page for KVM
+ * virtual machine.
+ */
+struct sgx_epc_page *sgx_alloc_vm_epc_page(unsigned int flags);
+int sgx_free_vm_epc_page(struct sgx_epc_page *entry);
+
+/*
+ * Virtual machine EPC buffer structure.
+ */
+struct sgx_vm_epc_buffer {
+	struct list_head buf_list;
+	struct list_head page_list;
+	unsigned int nr_pages;
+	unsigned long userspace_addr;
+	__u32 handle;
+};
+
+/*
+ * Flag in handle to indicate this EPC is allocated for virtual machine.
+ *
+ * The most significant bit of 32-bit is selected (the handle reported to
+ * userspace will be operated << 12), given the fact that EPC size is never
+ * expected to exceed 2G (at least so far).
+ *
+ * TODO: This flag can possibly be eliminated..
+ */
+#define	ISGX_VM_EPC	(1ul << 19)
+
+struct sgx_vm_epc_buffer *sgx_find_vm_epc_buffer(__u32 handle);
+int sgx_alloc_vm_epc_buffer(unsigned int npages, __u32 *handlep);
+int sgx_free_vm_epc_buffer(__u32 handle);
+int sgx_map_vm_epc_buffer(struct vm_area_struct *vma, __u32 handle);
+
 #endif /* __ARCH_X86_ISGX_H__ */
