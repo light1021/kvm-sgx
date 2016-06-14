@@ -491,3 +491,38 @@ void sgx_free_epc_page(struct sgx_epc_page *entry,
 	sgx_nr_free_epc_pages++;
 	spin_unlock(&sgx_free_list_lock);
 }
+
+struct sgx_epc_page *sgx_alloc_vm_epc_page(unsigned int flags)
+{
+	return sgx_alloc_epc_page(NULL, flags);
+}
+
+/*
+ * KVM guest may crash for some reason, in which case EREMOVE may not be
+ * executed by KVM guest SGX driver, therefore we need to do cleanup when we
+ * free EPC pages allocated to KVM guest. As currently we don't maintain
+ * EPC/enclave info from KVM guest, therefore we need to do eremove for every
+ * EPC page of KVM guest, and we may meet SGX_CHILD_PRESENT when eremove SECS
+ * in which case we should keep SECS in list and do it again after we have
+ * eremoved all regular EPC pages. This is the reason that we do EREMOVE
+ * unconditionally and report error code here.
+ */
+int sgx_free_vm_epc_page(struct sgx_epc_page *entry)
+{
+	int ret;
+	void *epc;
+
+	epc = sgx_get_epc_page(entry);
+	ret = __eremove(epc);
+	sgx_put_epc_page(epc);
+
+	if (ret)
+		return ret;
+
+	spin_lock(&sgx_free_list_lock);
+	list_add(&entry->free_list, &sgx_free_list);
+	sgx_nr_free_epc_pages++;
+	spin_unlock(&sgx_free_list_lock);
+
+	return 0;
+}

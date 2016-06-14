@@ -234,4 +234,11 @@ void sgx_free_epc_page(struct sgx_epc_page *entry,
 		       struct sgx_enclave *encl,
 		       unsigned int flags);
 
+/*
+ * Introduce dedicated functions for allocating and free EPC page for KVM
+ * virtual machine.
+ */
+struct sgx_epc_page *sgx_alloc_vm_epc_page(unsigned int flags);
+int sgx_free_vm_epc_page(struct sgx_epc_page *entry);
+
 #endif /* __ARCH_X86_ISGX_H__ */
