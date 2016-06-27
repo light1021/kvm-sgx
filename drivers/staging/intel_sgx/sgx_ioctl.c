@@ -242,8 +242,8 @@ static int validate_secs(const struct sgx_secs *secs)
 	if ((secs->xfrm & 0x3) != 0x3 || (secs->xfrm & ~sgx_xfrm_mask))
 		return -EINVAL;
 
-	/* SKL quirk */
-	if ((secs->xfrm & BIT(3)) != (secs->xfrm & BIT(4)))
+	/* Check that BNDREGS and BNDCSR are equal. */
+	if (((secs->xfrm >> 3) & 1) != ((secs->xfrm >> 4) & 1))
 		return -EINVAL;
 
 	for (i = 2; i < 64; i++) {
