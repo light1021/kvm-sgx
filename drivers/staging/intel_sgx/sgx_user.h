@@ -28,6 +28,10 @@
 	_IOW(SGX_MAGIC, 0x01, struct sgx_enclave_add_page)
 #define SGX_IOC_ENCLAVE_INIT \
 	_IOW(SGX_MAGIC, 0x02, struct sgx_enclave_init)
+#define SGX_IOC_ALLOC_VM_EPC \
+	_IOWR(SGX_MAGIC, 0x03, struct sgx_alloc_vm_epc)
+#define SGX_IOC_FREE_VM_EPC \
+	_IOW(SGX_MAGIC, 0x04, struct sgx_free_vm_epc)
 
 /* SGX leaf instruction return values */
 #define SGX_SUCCESS			0
@@ -78,5 +82,20 @@ struct sgx_enclave_init {
 struct sgx_enclave_destroy {
 	__u64	addr;
 };
+
+
+struct sgx_alloc_vm_epc {
+	/* IN: How many pages for guest */
+	__u32   nr_pages;
+	/* IN: Flags (placeholder) */
+	__u32   flags;
+	/* OUT: handle of the EPC buffer, passed as pgoff in mmap */
+	__u32   handle;
+} __attribute__((packed));
+
+struct sgx_free_vm_epc {
+	/* IN: handle of EPC buffer to be freed */
+	__u32   handle;
+} __attribute__((packed));
 
 #endif /* _UAPI_ASM_X86_SGX_H */

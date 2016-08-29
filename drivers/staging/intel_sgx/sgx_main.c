@@ -66,6 +66,9 @@ static int sgx_mmap(struct file *file, struct vm_area_struct *vma)
 	vma->vm_flags |= VM_PFNMAP | VM_DONTEXPAND | VM_RESERVED | VM_IO;
 #endif
 
+	if (vma->vm_pgoff & ISGX_VM_EPC)
+		return sgx_map_vm_epc_buffer(vma, vma->vm_pgoff);
+
 	return 0;
 }
 

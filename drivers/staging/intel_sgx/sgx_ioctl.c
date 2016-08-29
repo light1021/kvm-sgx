@@ -693,6 +693,50 @@ out_free_page:
 	return ret;
 }
 
+static long sgx_ioctl_alloc_vm_epc(struct file *filep, unsigned int cmd,
+		unsigned long arg)
+{
+	struct sgx_alloc_vm_epc *allocp = (struct sgx_alloc_vm_epc *)arg;
+	__u32 handle;
+	int ret;
+
+	pr_info("%s: nr_pages = 0x%lx\n", __func__,
+			(unsigned long)allocp->nr_pages);
+
+	ret = sgx_alloc_vm_epc_buffer(allocp->nr_pages, &handle);
+	if (ret)
+		return ret;
+
+	/* mmap will internally >> PAGE_SHIFT for offset parameter */
+	allocp->handle = (handle << PAGE_SHIFT);
+
+	pr_info("%s: succeed. buf handle = 0x%lx, allocp->handle = 0x%lx\n",
+			__func__, (unsigned long)handle,
+			(unsigned long)allocp->handle);
+
+	return 0;
+}
+
+static long sgx_ioctl_free_vm_epc(struct file *filep, unsigned int cmd,
+		unsigned long arg)
+{
+	struct sgx_free_vm_epc *freep = (struct sgx_free_vm_epc *)arg;
+	__u32 handle;
+	int ret;
+
+	handle = (freep->handle >> PAGE_SHIFT);
+
+	pr_info("%s: freep->handle = 0x%lx, handle = 0x%lx\n", __func__,
+			(unsigned long)freep->handle, (unsigned long)handle);
+
+	ret = sgx_free_vm_epc_buffer(handle);
+	if (ret)
+		return ret;
+
+	pr_info("%s: succeed.\n", __func__);
+	return 0;
+}
+
 typedef long (*sgx_ioctl_t)(struct file *filep, unsigned int cmd,
 			     unsigned long arg);
 
@@ -711,6 +755,12 @@ long sgx_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
 		break;
 	case SGX_IOC_ENCLAVE_INIT:
 		handler = sgx_ioctl_enclave_init;
+		break;
+	case SGX_IOC_ALLOC_VM_EPC:
+		handler = sgx_ioctl_alloc_vm_epc;
+		break;
+	case SGX_IOC_FREE_VM_EPC:
+		handler = sgx_ioctl_free_vm_epc;
 		break;
 	default:
 		return -EINVAL;
